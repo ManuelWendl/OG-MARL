@@ -7,7 +7,7 @@ from torch.distributions import Normal
 import matplotlib.pyplot as plt
 from collections import deque
 import random
-import time
+import copy
 from env import MultiAgentEnvironment
 import os
 
@@ -224,7 +224,6 @@ class DistributedGP:
             
             J_new.append(Ji)
             h_new.append(hi)
-        
         # Update natural parameters
         self.J_list = J_new
         self.h_list = h_new
@@ -510,8 +509,8 @@ class DistributedMBPO:
         return agent_states
     
     def initialize_model(self):
-        """Initialize the distributed GP model with collected data."""
-        print("Initializing distributed GP model...")
+        """Initialize the centralized GP model with collected data."""
+        print("Initializing centralized GP model...")
         
         # Prepare data for each agent
         dataset_list = []
@@ -527,7 +526,7 @@ class DistributedMBPO:
                 actions = np.array(actions)
                 next_states = np.array(next_states)
                 
-                # Compute delta states (for the agent's own state)
+                # Compute delta states
                 delta_states = next_states - states
                 
                 # Input is state + action
@@ -538,18 +537,16 @@ class DistributedMBPO:
             else:
                 raise ValueError(f"Not enough data in replay buffer for agent {i} to initialize model")
         
-        # Initialize model
-        self.model = DistributedGP(
-            N_AGENTS, 
+        # Initialize centralized model
+        self.model = CentralizedGP(
             AGENT_STATE_DIM, 
             ACTION_DIM, 
-            graph_type="Cycle", 
             kernel_type="combined"  # Use combined RBF + Linear kernel
         )
         self.model.initialize_model(dataset_list)
     
     def generate_imaginary_data(self):
-        """Generate imaginary data using the model for MBPO."""
+        """Generate imaginary data using the centralized model."""
         print("Generating imaginary data...")
         
         # Clear previous imaginary data
@@ -561,7 +558,7 @@ class DistributedMBPO:
             # Sample real states from agent's replay buffer as starting points
             if len(self.replay_buffers[agent_idx]) < BATCH_SIZE:
                 continue
-                
+            
             indices = np.random.choice(len(self.replay_buffers[agent_idx].buffer), BATCH_SIZE, replace=False)
             initial_transitions = [self.replay_buffers[agent_idx].buffer[idx] for idx in indices]
             
@@ -574,11 +571,10 @@ class DistributedMBPO:
                     action = agent.select_action(state)
                     
                     # Prepare input for GP model
-                    model_input = np.concatenate([state, action])
+                    model_input = np.concatenate([state, action]).reshape(1, -1)
                     
-                    # Predict next state using the model
-                    delta_state_mean, delta_state_var = self.model.predict_with_variance(
-                        agent_idx, model_input.reshape(1, -1))
+                    # Predict next state using the centralized model
+                    delta_state_mean, delta_state_var = self.model.predict_with_variance(model_input)
                     
                     # Add noise proportional to uncertainty
                     noise = np.random.normal(0, np.sqrt(delta_state_var))
@@ -587,10 +583,20 @@ class DistributedMBPO:
                     # Compute next state
                     next_state = state + delta_state
                     
-                    # Simple reward estimation (can be improved)
-                    reward = -0.01 * np.sum(next_state**2)  # Simple penalty for distance from origin
+                    # Use environment reward function instead of approximate reward
+                    env_copy = copy.deepcopy(self.env)
+                    # Set the environment to the current state (simplified)
+                    all_agent_positions = np.zeros((N_AGENTS, AGENT_STATE_DIM))
+                    all_agent_positions[agent_idx] = state
+                    env_copy.agent_positions = all_agent_positions
                     
-                    # Add to agent's model buffer
+                    # Step environment with just this agent's action
+                    all_actions = np.zeros((N_AGENTS, ACTION_DIM))
+                    all_actions[agent_idx] = action
+                    _, reward, _, _ = env_copy.step(all_actions)
+                    
+                    # Handle reward correctly - it's a single float, not an array
+                    # FIX: Don't try to index into it
                     self.model_buffers[agent_idx].add(state, action, reward, next_state, False)
                     
                     # Update state for next step in rollout
@@ -852,6 +858,145 @@ class DistributedMBPO:
         
         plt.savefig(f'results/training_curves_step_{step}.png')
         plt.close()
+
+class CentralizedGP:
+    """Centralized GP model used by all agents."""
+    
+    def __init__(self, state_dim, action_dim, kernel_type="combined"):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.input_dim = state_dim + action_dim
+        self.output_dim = state_dim
+        self.kernel_type = kernel_type
+        
+        # Kernel hyperparameters
+        self.lengthscale = 2.0  # Hyperparameter for RBF kernel
+        self.noise_var = 0.01  # Observation noise variance
+        self.linear_coef = 0.5  # Coefficient for linear kernel
+        self.linear_constant = 0.1  # Constant term in linear kernel
+        
+        # These will be initialized in initialize_model
+        self.Z = None  # Inducing points
+        self.m = None  # Mean vector
+        self.S = None  # Covariance matrix
+        self.Kzz = None  # Kernel matrix of inducing points
+        self.Kzz_inv = None  # Inverse of Kzz
+        
+        # For tracking model loss
+        self.model_losses = []
+    
+    def rbf_kernel(self, X1, X2):
+        """RBF kernel function."""
+        sqdist = np.sum(X1**2, 1).reshape(-1, 1) + np.sum(X2**2, 1) - 2*np.dot(X1, X2.T)
+        return np.exp(-0.5/self.lengthscale**2 * sqdist)
+    
+    def linear_kernel(self, X1, X2):
+        """Linear kernel function: k(x,y) = x^T y + c"""
+        return self.linear_coef * np.dot(X1, X2.T) + self.linear_constant
+    
+    def combined_kernel(self, X1, X2):
+        """Combined RBF and Linear kernel"""
+        return self.rbf_kernel(X1, X2) + self.linear_kernel(X1, X2)
+    
+    def compute_kernel(self, X1, X2):
+        """Compute kernel based on selected type"""
+        if self.kernel_type == "rbf":
+            return self.rbf_kernel(X1, X2)
+        elif self.kernel_type == "linear":
+            return self.linear_kernel(X1, X2)
+        elif self.kernel_type == "combined":
+            return self.combined_kernel(X1, X2)
+        else:
+            raise ValueError(f"Unsupported kernel type: {self.kernel_type}")
+    
+    def initialize_model(self, dataset_list, n_inducing=200):
+        """Initialize GP model using data from all agents."""
+        # Combine all data
+        all_X = np.vstack([X for X, _ in dataset_list])
+        all_Y = np.vstack([Y for _, Y in dataset_list])
+        
+        # Sample inducing points
+        if all_X.shape[0] > n_inducing:
+            idx = np.random.choice(all_X.shape[0], n_inducing, replace=False)
+            self.Z = all_X[idx]
+        else:
+            self.Z = all_X.copy()  # Use all data points if less than n_inducing
+            
+        # Compute Kzz (inducing points kernel matrix)
+        self.Kzz = self.compute_kernel(self.Z, self.Z)
+        self.Kzz_inv = np.linalg.inv(self.Kzz + 1e-6 * np.eye(self.Kzz.shape[0]))
+        
+        # Compute posterior
+        Kzx = self.compute_kernel(self.Z, all_X)
+        Kxz = Kzx.T
+        
+        # Compute posterior parameters
+        A = Kzx.dot(Kxz) / self.noise_var + self.Kzz
+        b = Kzx.dot(all_Y) / self.noise_var
+        
+        try:
+            L = np.linalg.cholesky(A)
+            self.S = np.linalg.inv(A)
+            self.m = self.S.dot(b)
+        except np.linalg.LinAlgError:
+            # Fall back to more stable but slower approach
+            self.S = np.linalg.inv(A + 1e-6 * np.eye(A.shape[0]))
+            self.m = self.S.dot(b)
+        
+        # Calculate initial loss
+        Y_pred = self.predict(all_X)
+        mse = np.mean(np.square(all_Y - Y_pred))
+        self.model_losses.append(mse)
+        
+        print(f"Model initialized with {len(self.Z)} inducing points, initial MSE: {mse:.4f}")
+        return mse
+    
+    def predict(self, X):
+        """Make prediction using posterior."""
+        K_test = self.compute_kernel(X, self.Z)
+        return K_test.dot(self.m)
+    
+    def predict_with_variance(self, X):
+        """Make prediction with variance for uncertainty estimation."""
+        K_test = self.compute_kernel(X, self.Z)
+        mean = K_test.dot(self.m)
+        
+        # Calculate variance
+        var_diag = np.diag(self.compute_kernel(X, X)) - np.sum(K_test.dot(self.S) * K_test, axis=1)
+        
+        # Ensure positive variance
+        var_diag = np.maximum(var_diag, 1e-6)
+        
+        return mean, var_diag
+    
+    def update_model(self, dataset_list):
+        """Update GP model with new data."""
+        # Combine all data
+        all_X = np.vstack([X for X, _ in dataset_list])
+        all_Y = np.vstack([Y for _, Y in dataset_list])
+        
+        # Recompute posterior with new data
+        Kzx = self.compute_kernel(self.Z, all_X)
+        Kxz = Kzx.T
+        
+        # Compute posterior parameters
+        A = Kzx.dot(Kxz) / self.noise_var + self.Kzz
+        b = Kzx.dot(all_Y) / self.noise_var
+        
+        try:
+            self.S = np.linalg.inv(A)
+            self.m = self.S.dot(b)
+        except np.linalg.LinAlgError:
+            # Fall back to more stable approach
+            self.S = np.linalg.inv(A + 1e-6 * np.eye(A.shape[0]))
+            self.m = self.S.dot(b)
+        
+        # Calculate model loss
+        Y_pred = self.predict(all_X)
+        mse = np.mean(np.square(all_Y - Y_pred))
+        self.model_losses.append(mse)
+        
+        return mse
 
 def main():
     """Main function to run the distributed MBPO algorithm."""
