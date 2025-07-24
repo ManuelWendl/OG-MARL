@@ -658,8 +658,12 @@ class DistributedMBPO:
                     if k in losses:
                         losses[k].append(v)
         
+        # Sample from both real and model buffers with appropriate ratio
+        real_batch_size = int(BATCH_SIZE * REAL_RATIO)
+        model_batch_size = BATCH_SIZE - real_batch_size
+        
         # Skip model updates for debugging
-        if False and total_steps % MODEL_TRAIN_FREQ == 0:
+        if total_steps % MODEL_TRAIN_FREQ == 0:
             self.update_model()
             self.generate_imaginary_data()
         
