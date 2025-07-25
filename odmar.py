@@ -33,6 +33,7 @@ MODEL_BATCH_SIZE = 256
 MODEL_TRAIN_FREQ = 250
 REAL_RATIO = 0.05  # Ratio of real to model data for policy update
 IMAGINARY_ROLLOUT_LENGTH = 5  # Length of model rollouts
+OPTIMISM_SCALE = 10  # Scale for optimism in intrinsic rewards
 SEED = 0
 
 # Set seeds for reproducibility
@@ -619,6 +620,9 @@ class DistributedMBPO:
                     all_actions = np.zeros((N_AGENTS, ACTION_DIM))
                     all_actions[agent_idx] = action
                     _, reward, _, _ = env_copy.step(all_actions)
+
+                    # Add optimism to reward
+                    reward += OPTIMISM_SCALE * np.sqrt(np.sum(delta_state_var))
                     
                     # Store transition
                     self.model_buffers[agent_idx].add(state, action, reward, next_state, False)
@@ -1141,7 +1145,7 @@ def main():
     plt.savefig('results/final_gp_comparison.png')
     
     # Show a demo of trained agents
-    env = MultiAgentEnvironment(n_agents=N_AGENTS, n_rewards=5, max_steps=100)
+    env = MultiAgentEnvironment(n_agents=N_AGENTS, n_rewards=10, max_steps=100)
     
     # Run episode with video
     env.run_episode_with_policy(
