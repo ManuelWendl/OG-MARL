@@ -31,9 +31,9 @@ ACTOR_LR = 3e-4
 CRITIC_LR = 3e-4
 MODEL_BATCH_SIZE = 256
 MODEL_TRAIN_FREQ = 250
-REAL_RATIO = 0.05  # Ratio of real to model data for policy update
-IMAGINARY_ROLLOUT_LENGTH = 5  # Length of model rollouts
-OPTIMISM_SCALE = 10  # Scale for optimism in intrinsic rewards
+REAL_RATIO = 0.0  # Ratio of real to model data for policy update
+IMAGINARY_ROLLOUT_LENGTH = 2  # Length of model rollouts
+OPTIMISM_SCALE = 0.0  # Scale for optimism in intrinsic rewards
 SEED = 0
 
 # Set seeds for reproducibility
@@ -572,10 +572,9 @@ class DistributedMBPO:
         model_name = "distributed" if use_distributed else "centralized"
         print(f"Generating imaginary data using {model_name} GP model...")
         
-        # Clear previous imaginary data
-        for buffer in self.model_buffers:
-            buffer.buffer.clear()
-        
+        # Track buffer sizes before generating data
+        buffer_sizes_before = [len(buffer) for buffer in self.model_buffers]
+    
         # Generate imaginary trajectories for each agent
         for agent_idx, agent in enumerate(self.agents):
             # Sample real states from agent's replay buffer as starting points
@@ -603,8 +602,7 @@ class DistributedMBPO:
                         delta_state_mean, delta_state_var = self.centralized_model.predict_with_variance(model_input)
                     
                     # Add noise proportional to uncertainty
-                    noise = np.random.normal(0, np.sqrt(delta_state_var))
-                    delta_state = delta_state_mean.flatten() + noise
+                    delta_state = delta_state_mean.flatten()
                     
                     # Compute next state
                     next_state = state + delta_state
@@ -629,6 +627,11 @@ class DistributedMBPO:
                     
                     # Update state for next step in rollout
                     state = next_state
+    
+        # Print buffer sizes for debugging
+        buffer_sizes_after = [len(buffer) for buffer in self.model_buffers]
+        print(f"Model buffer sizes before: {buffer_sizes_before}")
+        print(f"Model buffer sizes after: {buffer_sizes_after}")
     
     def update_model(self):
         """Update both GP models with new data."""
@@ -736,32 +739,68 @@ class DistributedMBPO:
         plt.close()
     
     def train_step(self, total_steps):
-        """Perform one training step."""
+        """Perform one training step using both real and model data."""
         losses = {
             'critic_loss': [],
             'actor_loss': [],
             'alpha_loss': []
         }
         
-        # Update each agent using only real environment data
-        for agent_idx, agent in enumerate(self.agents):
-            if len(self.replay_buffers[agent_idx]) >= BATCH_SIZE:
-                # Sample batch from replay buffer
-                batch = self.replay_buffers[agent_idx].sample()
-                
-                # Update agent parameters
-                update_info = agent.update_parameters(batch)
-                
-                # Record losses
-                for k, v in update_info.items():
-                    if k in losses:
-                        losses[k].append(v)
-        
         # Update models and generate imaginary data periodically
         if total_steps % MODEL_TRAIN_FREQ == 0:
             self.update_model()
+            # Alternate between centralized and distributed model
+            use_distributed = (total_steps // MODEL_TRAIN_FREQ) % 2 == 0
+            self.generate_imaginary_data(use_distributed=use_distributed)
+        
+        # Update each agent using combined real and model data
+        for agent_idx, agent in enumerate(self.agents):
+            real_buffer = self.replay_buffers[agent_idx]
+            model_buffer = self.model_buffers[agent_idx]
             
-            self.generate_imaginary_data(use_distributed=False)
+            # Skip if real buffer doesn't have enough data
+            if len(real_buffer) < BATCH_SIZE:
+                continue
+            
+            # Case 1: If we have model data, mix it according to REAL_RATIO
+            if len(model_buffer) >= BATCH_SIZE:
+                # Calculate number of samples from each buffer
+                real_samples = max(int(BATCH_SIZE * REAL_RATIO), 1)  # At least 1 real sample
+                model_samples = BATCH_SIZE - real_samples
+                
+                # Sample from real buffer
+                real_indices = np.random.choice(len(real_buffer.buffer), real_samples, replace=False)
+                real_batch = [real_buffer.buffer[idx] for idx in real_indices]
+                
+                # Sample from model buffer
+                model_indices = np.random.choice(len(model_buffer.buffer), model_samples, replace=False)
+                model_batch = [model_buffer.buffer[idx] for idx in model_indices]
+                
+                # Combine batches and shuffle
+                combined_batch = real_batch + model_batch
+                random.shuffle(combined_batch)  # Mix real and model data
+                
+                # Convert to tensors
+                states, actions, rewards, next_states, dones = zip(*combined_batch)
+                batch = (
+                    torch.FloatTensor(states).to(device),
+                    torch.FloatTensor(actions).to(device),
+                    torch.FloatTensor(rewards).unsqueeze(1).to(device),
+                    torch.FloatTensor(next_states).to(device),
+                    torch.FloatTensor(dones).unsqueeze(1).to(device)
+                )
+            
+            # Case 2: If no model data yet, just use real data
+            else:
+                batch = real_buffer.sample()
+            
+            # Update agent parameters with the batch
+            update_info = agent.update_parameters(batch)
+            
+            # Record losses
+            for k, v in update_info.items():
+                if k in losses:
+                    losses[k].append(v)
         
         # Average losses across agents
         avg_losses = {}
