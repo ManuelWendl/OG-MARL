@@ -11,7 +11,8 @@ class MultiAgentEnvironment:
                  reward_sizes: List[float] = [1, 5, 10],
                  n_rewards: int = 6,
                  noise_scale: float = 0.1,
-                 max_steps: int = 100):
+                 max_steps: int = 100,
+                 action_penalty: bool = False):
         """
         Multi-agent environment with sparse rewards.
         
@@ -22,6 +23,7 @@ class MultiAgentEnvironment:
             n_rewards: Number of rewards to place
             noise_scale: Scale of noise added to agent dynamics
             max_steps: Maximum steps per episode
+            action_penalty: Whether to apply a penalty for actions
         """
         self.n_agents = n_agents
         self.world_bounds = world_bounds
@@ -29,6 +31,7 @@ class MultiAgentEnvironment:
         self.n_rewards = n_rewards
         self.noise_scale = noise_scale
         self.max_steps = max_steps
+        self.action_penalty = action_penalty
         
         # Normalize rewards to be in [0, 1]
         if self.reward_sizes and max(self.reward_sizes) > 0:
@@ -135,6 +138,10 @@ class MultiAgentEnvironment:
         
         # Check for reward collection
         total_reward = self._collect_rewards()
+
+        if self.action_penalty:
+            # Apply action penalty if enabled
+            total_reward -= np.sum(np.abs(actions)) * 0.1
         
         # Update step counter
         self.current_step += 1

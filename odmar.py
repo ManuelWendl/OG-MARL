@@ -15,27 +15,34 @@ import os
 
 # Use GPU if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
 # Constants
+MAX_TRAINING_STEPS = 10000
+MAX_STEPS = 100
+EVAL_INTERVAL = 200
 N_AGENTS = 5
-AGENT_STATE_DIM = 2  # Each agent has 2D position (x, y)
-ACTION_DIM = 2  # Each agent has 2D action (dx, dy)
-GLOBAL_STATE_DIM = N_AGENTS * AGENT_STATE_DIM  # Used for environment interaction
+ACTION_PENALTY = False  
+AGENT_STATE_DIM = 2  
+ACTION_DIM = 2  
+GLOBAL_STATE_DIM = N_AGENTS * AGENT_STATE_DIM  
 CONSENSUS_ROUNDS = 100
 
 # Hyperparameters
 BUFFER_SIZE = 1000000
 BATCH_SIZE = 256
 GAMMA = 0.99
-TAU = 0.005  # For soft update
+TAU = 0.005  
 ALPHA_LR = 3e-4
 ACTOR_LR = 3e-4
 CRITIC_LR = 3e-4
 MODEL_BATCH_SIZE = 256
 MODEL_TRAIN_FREQ = 250
-REAL_RATIO = 0.0  # Ratio of real to model data for policy update
-IMAGINARY_ROLLOUT_LENGTH = 2  # Length of model rollouts
-OPTIMISM_SCALE = 0.001  # Scale for optimism in intrinsic rewards
+USE_DISTRIBUTED_MODEL = True  
+UPDATES_PER_STEP = 10  
+REAL_RATIO = 0.0  
+IMAGINARY_ROLLOUT_LENGTH = 2  
+OPTIMISM_SCALE = 0.0 
 SEED = 0
 
 # Set seeds for reproducibility
@@ -251,6 +258,144 @@ class DistributedGP:
         mean = K_test.dot(self.m_list[agent_idx])
         var = np.diag(self.compute_kernel(X, X) - K_test.dot(self.S_list[agent_idx]).dot(K_test.T))
         return mean, var
+    
+class CentralizedGP:
+    """Centralized GP model used by all agents."""
+    
+    def __init__(self, state_dim, action_dim, kernel_type="combined"):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.input_dim = state_dim + action_dim
+        self.output_dim = state_dim
+        self.kernel_type = kernel_type
+        
+        # Kernel hyperparameters
+        self.lengthscale = 2.0  # Hyperparameter for RBF kernel
+        self.noise_var = 0.01  # Observation noise variance
+        self.linear_coef = 0.5  # Coefficient for linear kernel
+        self.linear_constant = 0.1  # Constant term in linear kernel
+        
+        # These will be initialized in initialize_model
+        self.Z = None  # Inducing points
+        self.m = None  # Mean vector
+        self.S = None  # Covariance matrix
+        self.Kzz = None  # Kernel matrix of inducing points
+        self.Kzz_inv = None  # Inverse of Kzz
+        
+        # For tracking model loss
+        self.model_losses = []
+    
+    def rbf_kernel(self, X1, X2):
+        """RBF kernel function."""
+        sqdist = np.sum(X1**2, 1).reshape(-1, 1) + np.sum(X2**2, 1) - 2*np.dot(X1, X2.T)
+        return np.exp(-0.5/self.lengthscale**2 * sqdist)
+    
+    def linear_kernel(self, X1, X2):
+        """Linear kernel function: k(x,y) = x^T y + c"""
+        return self.linear_coef * np.dot(X1, X2.T) + self.linear_constant
+    
+    def combined_kernel(self, X1, X2):
+        """Combined RBF and Linear kernel"""
+        return self.rbf_kernel(X1, X2) + self.linear_kernel(X1, X2)
+    
+    def compute_kernel(self, X1, X2):
+        """Compute kernel based on selected type"""
+        if self.kernel_type == "rbf":
+            return self.rbf_kernel(X1, X2)
+        elif self.kernel_type == "linear":
+            return self.linear_kernel(X1, X2)
+        elif self.kernel_type == "combined":
+            return self.combined_kernel(X1, X2)
+        else:
+            raise ValueError(f"Unsupported kernel type: {self.kernel_type}")
+    
+    def initialize_model(self, dataset_list, n_inducing=1000):
+        """Initialize GP model using data from all agents."""
+        # Combine all data
+        all_X = np.vstack([X for X, _ in dataset_list])
+        all_Y = np.vstack([Y for _, Y in dataset_list])
+        
+        # Sample inducing points
+        if all_X.shape[0] > n_inducing:
+            idx = np.random.choice(all_X.shape[0], n_inducing, replace=False)
+            self.Z = all_X[idx]
+        else:
+            self.Z = all_X.copy()  # Use all data points if less than n_inducing
+            
+        # Compute Kzz (inducing points kernel matrix)
+        self.Kzz = self.compute_kernel(self.Z, self.Z)
+        self.Kzz_inv = np.linalg.inv(self.Kzz + 1e-6 * np.eye(self.Kzz.shape[0]))
+        
+        # Compute posterior
+        Kzx = self.compute_kernel(self.Z, all_X)
+        Kxz = Kzx.T
+        
+        # Compute posterior parameters
+        A = Kzx.dot(Kxz) / self.noise_var + self.Kzz
+        b = Kzx.dot(all_Y) / self.noise_var
+        
+        try:
+            self.S = np.linalg.inv(A)
+            self.m = self.S.dot(b)
+        except np.linalg.LinAlgError:
+            # Fall back to more stable but slower approach
+            self.S = np.linalg.inv(A + 1e-6 * np.eye(A.shape[0]))
+            self.m = self.S.dot(b)
+        
+        # Calculate initial loss
+        Y_pred = self.predict(all_X)
+        mse = np.mean(np.square(all_Y - Y_pred))
+        self.model_losses.append(mse)
+        
+        print(f"Model initialized with {len(self.Z)} inducing points, initial MSE: {mse:.4f}")
+        return mse
+    
+    def predict(self, X):
+        """Make prediction using posterior."""
+        K_test = self.compute_kernel(X, self.Z)
+        return K_test.dot(self.m)
+    
+    def predict_with_variance(self, X):
+        """Make prediction with variance for uncertainty estimation."""
+        K_test = self.compute_kernel(X, self.Z)
+        mean = K_test.dot(self.m)
+        
+        # Calculate variance
+        var_diag = np.diag(self.compute_kernel(X, X)) - np.sum(K_test.dot(self.S) * K_test, axis=1)
+        
+        # Ensure positive variance
+        var_diag = np.maximum(var_diag, 1e-6)
+        
+        return mean, var_diag
+    
+    def update_model(self, dataset_list):
+        """Update GP model with new data."""
+        # Combine all data
+        all_X = np.vstack([X for X, _ in dataset_list])
+        all_Y = np.vstack([Y for _, Y in dataset_list])
+        
+        # Recompute posterior with new data
+        Kzx = self.compute_kernel(self.Z, all_X)
+        Kxz = Kzx.T
+        
+        # Compute posterior parameters
+        A = Kzx.dot(Kxz) / self.noise_var + self.Kzz
+        b = Kzx.dot(all_Y) / self.noise_var
+        
+        try:
+            self.S = np.linalg.inv(A)
+            self.m = self.S.dot(b)
+        except np.linalg.LinAlgError:
+            # Fall back to more stable approach
+            self.S = np.linalg.inv(A + 1e-6 * np.eye(A.shape[0]))
+            self.m = self.S.dot(b)
+        
+        # Calculate model loss
+        Y_pred = self.predict(all_X)
+        mse = np.mean(np.square(all_Y - Y_pred))
+        self.model_losses.append(mse)
+        
+        return mse
 
 class PolicyNetwork(nn.Module):
     """Actor network for SAC."""
@@ -452,7 +597,7 @@ class DistributedMBPO:
     
     def __init__(self):
         # Create environment
-        self.env = MultiAgentEnvironment(n_agents=N_AGENTS, n_rewards=10, max_steps=200)
+        self.env = MultiAgentEnvironment(n_agents=N_AGENTS, n_rewards=10, max_steps=MAX_STEPS, action_penalty=ACTION_PENALTY)
         
         # Create agents
         self.agents = [SACAgent(i, AGENT_STATE_DIM, ACTION_DIM) for i in range(N_AGENTS)]
@@ -752,57 +897,58 @@ class DistributedMBPO:
         if total_steps % MODEL_TRAIN_FREQ == 0:
             self.update_model()
             # Alternate between centralized and distributed model
-            use_distributed = (total_steps // MODEL_TRAIN_FREQ) % 2 == 0
-            self.generate_imaginary_data(use_distributed=use_distributed)
+            self.generate_imaginary_data(use_distributed=USE_DISTRIBUTED_MODEL)
+
+        for _ in range(UPDATES_PER_STEP):
         
-        # Update each agent using combined real and model data
-        for agent_idx, agent in enumerate(self.agents):
-            real_buffer = self.replay_buffers[agent_idx]
-            model_buffer = self.model_buffers[agent_idx]
-            
-            # Skip if real buffer doesn't have enough data
-            if len(real_buffer) < BATCH_SIZE:
-                continue
-            
-            # Case 1: If we have model data, mix it according to REAL_RATIO
-            if len(model_buffer) >= BATCH_SIZE:
-                # Calculate number of samples from each buffer
-                real_samples = max(int(BATCH_SIZE * REAL_RATIO), 1)  # At least 1 real sample
-                model_samples = BATCH_SIZE - real_samples
+            # Update each agent using combined real and model data
+            for agent_idx, agent in enumerate(self.agents):
+                real_buffer = self.replay_buffers[agent_idx]
+                model_buffer = self.model_buffers[agent_idx]
                 
-                # Sample from real buffer
-                real_indices = np.random.choice(len(real_buffer.buffer), real_samples, replace=False)
-                real_batch = [real_buffer.buffer[idx] for idx in real_indices]
+                # Skip if real buffer doesn't have enough data
+                if len(real_buffer) < BATCH_SIZE:
+                    continue
                 
-                # Sample from model buffer
-                model_indices = np.random.choice(len(model_buffer.buffer), model_samples, replace=False)
-                model_batch = [model_buffer.buffer[idx] for idx in model_indices]
+                # Case 1: If we have model data, mix it according to REAL_RATIO
+                if len(model_buffer) >= BATCH_SIZE:
+                    # Calculate number of samples from each buffer
+                    real_samples = max(int(BATCH_SIZE * REAL_RATIO), 1)  # At least 1 real sample
+                    model_samples = BATCH_SIZE - real_samples
+                    
+                    # Sample from real buffer
+                    real_indices = np.random.choice(len(real_buffer.buffer), real_samples, replace=False)
+                    real_batch = [real_buffer.buffer[idx] for idx in real_indices]
+                    
+                    # Sample from model buffer
+                    model_indices = np.random.choice(len(model_buffer.buffer), model_samples, replace=False)
+                    model_batch = [model_buffer.buffer[idx] for idx in model_indices]
+                    
+                    # Combine batches and shuffle
+                    combined_batch = real_batch + model_batch
+                    random.shuffle(combined_batch)  # Mix real and model data
+                    
+                    # Convert to tensors
+                    states, actions, rewards, next_states, dones = zip(*combined_batch)
+                    batch = (
+                        torch.FloatTensor(states).to(device),
+                        torch.FloatTensor(actions).to(device),
+                        torch.FloatTensor(rewards).unsqueeze(1).to(device),
+                        torch.FloatTensor(next_states).to(device),
+                        torch.FloatTensor(dones).unsqueeze(1).to(device)
+                    )
                 
-                # Combine batches and shuffle
-                combined_batch = real_batch + model_batch
-                random.shuffle(combined_batch)  # Mix real and model data
+                # Case 2: If no model data yet, just use real data
+                else:
+                    batch = real_buffer.sample()
                 
-                # Convert to tensors
-                states, actions, rewards, next_states, dones = zip(*combined_batch)
-                batch = (
-                    torch.FloatTensor(states).to(device),
-                    torch.FloatTensor(actions).to(device),
-                    torch.FloatTensor(rewards).unsqueeze(1).to(device),
-                    torch.FloatTensor(next_states).to(device),
-                    torch.FloatTensor(dones).unsqueeze(1).to(device)
-                )
-            
-            # Case 2: If no model data yet, just use real data
-            else:
-                batch = real_buffer.sample()
-            
-            # Update agent parameters with the batch
-            update_info = agent.update_parameters(batch)
-            
-            # Record losses
-            for k, v in update_info.items():
-                if k in losses:
-                    losses[k].append(v)
+                # Update agent parameters with the batch
+                update_info = agent.update_parameters(batch)
+                
+                # Record losses
+                for k, v in update_info.items():
+                    if k in losses:
+                        losses[k].append(v)
         
         # Average losses across agents
         avg_losses = {}
@@ -812,7 +958,7 @@ class DistributedMBPO:
         
         return avg_losses
     
-    def train(self, max_steps=1000000, eval_interval=5000, run_id=None, plot_dir=None):
+    def train(self, max_steps=MAX_TRAINING_STEPS, eval_interval=EVAL_INTERVAL, run_id=None, plot_dir=None):
         """Train the distributed MBPO algorithm."""
         print("Starting training...")
         
@@ -1009,145 +1155,6 @@ class DistributedMBPO:
         if self.prediction_errors['centralized'] and self.prediction_errors['distributed']:
             self.plot_gp_comparison()
 
-class CentralizedGP:
-    """Centralized GP model used by all agents."""
-    
-    def __init__(self, state_dim, action_dim, kernel_type="combined"):
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.input_dim = state_dim + action_dim
-        self.output_dim = state_dim
-        self.kernel_type = kernel_type
-        
-        # Kernel hyperparameters
-        self.lengthscale = 2.0  # Hyperparameter for RBF kernel
-        self.noise_var = 0.01  # Observation noise variance
-        self.linear_coef = 0.5  # Coefficient for linear kernel
-        self.linear_constant = 0.1  # Constant term in linear kernel
-        
-        # These will be initialized in initialize_model
-        self.Z = None  # Inducing points
-        self.m = None  # Mean vector
-        self.S = None  # Covariance matrix
-        self.Kzz = None  # Kernel matrix of inducing points
-        self.Kzz_inv = None  # Inverse of Kzz
-        
-        # For tracking model loss
-        self.model_losses = []
-    
-    def rbf_kernel(self, X1, X2):
-        """RBF kernel function."""
-        sqdist = np.sum(X1**2, 1).reshape(-1, 1) + np.sum(X2**2, 1) - 2*np.dot(X1, X2.T)
-        return np.exp(-0.5/self.lengthscale**2 * sqdist)
-    
-    def linear_kernel(self, X1, X2):
-        """Linear kernel function: k(x,y) = x^T y + c"""
-        return self.linear_coef * np.dot(X1, X2.T) + self.linear_constant
-    
-    def combined_kernel(self, X1, X2):
-        """Combined RBF and Linear kernel"""
-        return self.rbf_kernel(X1, X2) + self.linear_kernel(X1, X2)
-    
-    def compute_kernel(self, X1, X2):
-        """Compute kernel based on selected type"""
-        if self.kernel_type == "rbf":
-            return self.rbf_kernel(X1, X2)
-        elif self.kernel_type == "linear":
-            return self.linear_kernel(X1, X2)
-        elif self.kernel_type == "combined":
-            return self.combined_kernel(X1, X2)
-        else:
-            raise ValueError(f"Unsupported kernel type: {self.kernel_type}")
-    
-    def initialize_model(self, dataset_list, n_inducing=1000):
-        """Initialize GP model using data from all agents."""
-        # Combine all data
-        all_X = np.vstack([X for X, _ in dataset_list])
-        all_Y = np.vstack([Y for _, Y in dataset_list])
-        
-        # Sample inducing points
-        if all_X.shape[0] > n_inducing:
-            idx = np.random.choice(all_X.shape[0], n_inducing, replace=False)
-            self.Z = all_X[idx]
-        else:
-            self.Z = all_X.copy()  # Use all data points if less than n_inducing
-            
-        # Compute Kzz (inducing points kernel matrix)
-        self.Kzz = self.compute_kernel(self.Z, self.Z)
-        self.Kzz_inv = np.linalg.inv(self.Kzz + 1e-6 * np.eye(self.Kzz.shape[0]))
-        
-        # Compute posterior
-        Kzx = self.compute_kernel(self.Z, all_X)
-        Kxz = Kzx.T
-        
-        # Compute posterior parameters
-        A = Kzx.dot(Kxz) / self.noise_var + self.Kzz
-        b = Kzx.dot(all_Y) / self.noise_var
-        
-        try:
-            L = np.linalg.cholesky(A)
-            self.S = np.linalg.inv(A)
-            self.m = self.S.dot(b)
-        except np.linalg.LinAlgError:
-            # Fall back to more stable but slower approach
-            self.S = np.linalg.inv(A + 1e-6 * np.eye(A.shape[0]))
-            self.m = self.S.dot(b)
-        
-        # Calculate initial loss
-        Y_pred = self.predict(all_X)
-        mse = np.mean(np.square(all_Y - Y_pred))
-        self.model_losses.append(mse)
-        
-        print(f"Model initialized with {len(self.Z)} inducing points, initial MSE: {mse:.4f}")
-        return mse
-    
-    def predict(self, X):
-        """Make prediction using posterior."""
-        K_test = self.compute_kernel(X, self.Z)
-        return K_test.dot(self.m)
-    
-    def predict_with_variance(self, X):
-        """Make prediction with variance for uncertainty estimation."""
-        K_test = self.compute_kernel(X, self.Z)
-        mean = K_test.dot(self.m)
-        
-        # Calculate variance
-        var_diag = np.diag(self.compute_kernel(X, X)) - np.sum(K_test.dot(self.S) * K_test, axis=1)
-        
-        # Ensure positive variance
-        var_diag = np.maximum(var_diag, 1e-6)
-        
-        return mean, var_diag
-    
-    def update_model(self, dataset_list):
-        """Update GP model with new data."""
-        # Combine all data
-        all_X = np.vstack([X for X, _ in dataset_list])
-        all_Y = np.vstack([Y for _, Y in dataset_list])
-        
-        # Recompute posterior with new data
-        Kzx = self.compute_kernel(self.Z, all_X)
-        Kxz = Kzx.T
-        
-        # Compute posterior parameters
-        A = Kzx.dot(Kxz) / self.noise_var + self.Kzz
-        b = Kzx.dot(all_Y) / self.noise_var
-        
-        try:
-            self.S = np.linalg.inv(A)
-            self.m = self.S.dot(b)
-        except np.linalg.LinAlgError:
-            # Fall back to more stable approach
-            self.S = np.linalg.inv(A + 1e-6 * np.eye(A.shape[0]))
-            self.m = self.S.dot(b)
-        
-        # Calculate model loss
-        Y_pred = self.predict(all_X)
-        mse = np.mean(np.square(all_Y - Y_pred))
-        self.model_losses.append(mse)
-        
-        return mse
-
 def main(seed=None):
     """Main function to run the distributed MBPO algorithm with GP comparison."""
     # Set seed if provided
@@ -1174,8 +1181,8 @@ def main(seed=None):
     # Initialize and train the algorithm
     dist_mbpo = DistributedMBPO()
     episode_rewards, steps_per_episode = dist_mbpo.train(
-        max_steps=15000,  # Adjust based on available computational resources
-        eval_interval=150,
+        max_steps=MAX_TRAINING_STEPS,  # Adjust based on available computational resources
+        eval_interval=EVAL_INTERVAL,
         run_id=run_id,
         plot_dir=plot_dir
     )
@@ -1249,7 +1256,7 @@ def main(seed=None):
     plt.savefig(f'{plot_dir}/final_gp_comparison.png')
     
     # Show a demo of trained agents
-    env = MultiAgentEnvironment(n_agents=N_AGENTS, n_rewards=10, max_steps=100)
+    env = MultiAgentEnvironment(n_agents=N_AGENTS, n_rewards=10, max_steps=MAX_STEPS, action_penalty=ACTION_PENALTY)
     
     # Run episode with video
     env.run_episode_with_policy(
@@ -1262,9 +1269,9 @@ def main(seed=None):
 def run_multiple_seeds(seeds=[0, 1, 2, 3, 4]):
     """Run multiple training instances with different random seeds."""
     for seed in seeds:
-        print(f"===============================================")
+        print("===============================================")
         print(f"Starting training with seed {seed}")
-        print(f"===============================================")
+        print("===============================================")
         main(seed=seed)
 
 def plot_aggregated_results(seeds=[0, 1, 2, 3, 4]):
