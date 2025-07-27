@@ -12,6 +12,7 @@ import random
 import copy
 from env import MultiAgentEnvironment
 import os
+import sys
 
 # Use GPU if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1332,11 +1333,22 @@ def plot_aggregated_results(seeds=[0, 1, 2, 3, 4]):
     print(f"Aggregated plots saved to {agg_plot_dir}/")
 
 if __name__ == "__main__":
-    # For a single run with default seed:
-    # main()
-    
-    # For multiple seeds (uncomment to use):
-    run_multiple_seeds(seeds=[0, 1, 2, 3, 4])
+    # Default seeds
+    default_seeds = [0, 1, 2, 3, 4]
+    selected_seeds = None
 
-    # To plot aggregated results after multiple runs:
-    plot_aggregated_results(seeds=[0, 1, 2, 3, 4])
+    # Parse command-line arguments
+    for arg in sys.argv[1:]:
+        if arg.startswith("seed="):
+            try:
+                seed_val = int(arg.split("=")[1])
+                selected_seeds = [seed_val]
+            except ValueError:
+                print("Invalid seed value. Using default seeds.")
+                selected_seeds = default_seeds
+
+    if selected_seeds is None:
+        selected_seeds = default_seeds
+
+    run_multiple_seeds(seeds=selected_seeds)
+    plot_aggregated_results(seeds=selected_seeds)
