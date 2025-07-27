@@ -27,3 +27,6 @@ To run the ODMAR algorithm, execute the following command:
 python odmar.py
 ```
 This will start either a single seed training or a multi-seed training session, depending on the configuration in the script.
+
+## Configuration
+The parameters for ODMAR are configured in the beginning of the `odmar.py` file. You can adjust the following parameters by replacing the default values by the values given in the configs directory: `configs/`. This will reproduce the different results shown in the paper.
