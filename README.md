@@ -2,6 +2,9 @@
 
 This repository implements the ODMAR algorithm, which combines distributed model-based reinforcement learning with optimistic exploration strategies. The code is designed to work with multiple agents in a shared environment, leveraging both real and imaginary data for training.
 
+As a baseline, ODMAR is compared against standard SAC agents that do not share a world model or transition data:
+![sac baselin](assets/sac.png)
+
 ## Structure
 - `odmar.py`: Main script with the ODMAR implementation and the main running script.
 - `distributed_gp.py`: Contains the distributed GP model example shown in the paper.
