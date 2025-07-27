@@ -1,3 +1,5 @@
+import json
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -33,7 +35,7 @@ MODEL_BATCH_SIZE = 256
 MODEL_TRAIN_FREQ = 250
 REAL_RATIO = 0.0  # Ratio of real to model data for policy update
 IMAGINARY_ROLLOUT_LENGTH = 2  # Length of model rollouts
-OPTIMISM_SCALE = 0.0  # Scale for optimism in intrinsic rewards
+OPTIMISM_SCALE = 0.001  # Scale for optimism in intrinsic rewards
 SEED = 0
 
 # Set seeds for reproducibility
@@ -567,7 +569,7 @@ class DistributedMBPO:
         # Initial comparison
         self.compare_gp_models(dataset_list)
     
-    def generate_imaginary_data(self, use_distributed=False):
+    def generate_imaginary_data(self, use_distributed=True):
         """Generate imaginary data using the selected GP model."""
         model_name = "distributed" if use_distributed else "centralized"
         print(f"Generating imaginary data using {model_name} GP model...")
@@ -810,7 +812,7 @@ class DistributedMBPO:
         
         return avg_losses
     
-    def train(self, max_steps=1000000, eval_interval=5000):
+    def train(self, max_steps=1000000, eval_interval=5000, run_id=None, plot_dir=None):
         """Train the distributed MBPO algorithm."""
         print("Starting training...")
         
@@ -896,7 +898,9 @@ class DistributedMBPO:
                     alpha_losses, 
                     model_losses, 
                     eval_rewards,
-                    total_steps
+                    total_steps,
+                    run_id=run_id,
+                    plot_dir=plot_dir
                 )
                 
                 print(f"Step {total_steps}: Eval reward = {eval_reward:.2f}")
@@ -942,7 +946,7 @@ class DistributedMBPO:
             
         return actions
 
-    def plot_training_curves(self, steps, critic_losses, actor_losses, alpha_losses, model_losses, eval_rewards, step):
+    def plot_training_curves(self, steps, critic_losses, actor_losses, alpha_losses, model_losses, eval_rewards, step, run_id=None, plot_dir=None):
         """Plot and save training curves."""
         # Original plots for training curves (keeping as is)
         fig, axs = plt.subplots(2, 2, figsize=(12, 10))
@@ -995,7 +999,10 @@ class DistributedMBPO:
         
         # Create results directory if it doesn't exist
         os.makedirs("results", exist_ok=True)
-        plt.savefig(f'results/training_curves_step_{step}.png')
+        if run_id:
+            plt.savefig(f'{plot_dir}/training_curves_step_{step}.png')
+        else:
+            plt.savefig(f'results/training_curves_step_{step}.png')
         plt.close()
         
         # Plot GP model comparison if we have data
@@ -1141,26 +1148,84 @@ class CentralizedGP:
         
         return mse
 
-def main():
+def main(seed=None):
     """Main function to run the distributed MBPO algorithm with GP comparison."""
-    # Create output directory if it doesn't exist
-    os.makedirs("results", exist_ok=True)
+    # Set seed if provided
+    if seed is not None:
+        global SEED
+        SEED = seed
+        torch.manual_seed(SEED)
+        np.random.seed(SEED)
+        random.seed(SEED)
+    
+    # Create timestamp for unique run identification
+    timestamp = int(time.time())
+    run_id = f"seed_{SEED}_time_{timestamp}"
+    
+    # Create output directories
+    results_dir = "results"
+    data_dir = f"{results_dir}/data"
+    plot_dir = f"{results_dir}/{run_id}"
+    os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(plot_dir, exist_ok=True)
+    
+    print(f"Starting training run with seed {SEED}")
     
     # Initialize and train the algorithm
     dist_mbpo = DistributedMBPO()
     episode_rewards, steps_per_episode = dist_mbpo.train(
-        max_steps=10000,  # Adjust based on available computational resources
-        eval_interval=800
+        max_steps=15000,  # Adjust based on available computational resources
+        eval_interval=150,
+        run_id=run_id,
+        plot_dir=plot_dir
     )
     
-    # Plot final training results
+    # Collect all training history data
+    training_history = {
+        'seed': SEED,
+        'timestamp': timestamp,
+        'episode_rewards': episode_rewards,
+        'steps_per_episode': steps_per_episode,
+        'prediction_errors': {
+            'centralized': dist_mbpo.prediction_errors['centralized'],
+            'distributed': dist_mbpo.prediction_errors['distributed'],
+            'difference': dist_mbpo.prediction_errors['difference']
+        },
+        'agent_losses': {
+            'critic_losses': [agent.critic_losses for agent in dist_mbpo.agents],
+            'actor_losses': [agent.actor_losses for agent in dist_mbpo.agents],
+            'alpha_losses': [agent.alpha_losses for agent in dist_mbpo.agents]
+        },
+        'model_losses': dist_mbpo.centralized_model.model_losses if dist_mbpo.centralized_model else [],
+    }
+    
+    # Save to JSON file
+    filename = f"{data_dir}/history_seed_{SEED}.json"
+    with open(filename, 'w') as f:
+        # Convert numpy arrays to lists for JSON serialization
+        json_data = {k: v if not isinstance(v, (np.ndarray, list)) or not isinstance(v[0], np.ndarray)
+                     else [x.tolist() if isinstance(x, np.ndarray) else x for x in v]
+                     for k, v in training_history.items()}
+        
+        # Handle nested dictionaries
+        for k, v in json_data.items():
+            if isinstance(v, dict):
+                json_data[k] = {k2: v2 if not isinstance(v2, (np.ndarray, list)) or not isinstance(v2[0], np.ndarray)
+                              else [x.tolist() if isinstance(x, np.ndarray) else x for x in v2]
+                              for k2, v2 in v.items()}
+                
+        json.dump(json_data, f, indent=2)
+    
+    print(f"Training history saved to {filename}")
+    
+    # Plot final training results in the run-specific directory
     plt.figure(figsize=(10, 6))
     plt.plot(episode_rewards)
     plt.title('Episode Rewards')
     plt.xlabel('Episode')
     plt.ylabel('Total Reward')
     plt.grid(True)
-    plt.savefig('results/final_rewards.png')
+    plt.savefig(f'{plot_dir}/final_rewards.png')
     
     plt.figure(figsize=(10, 6))
     plt.plot(steps_per_episode)
@@ -1168,7 +1233,7 @@ def main():
     plt.xlabel('Episode')
     plt.ylabel('Steps')
     plt.grid(True)
-    plt.savefig('results/steps_per_episode.png')
+    plt.savefig(f'{plot_dir}/steps_per_episode.png')
     
     # Final GP model comparison
     plt.figure(figsize=(10, 6))
@@ -1181,7 +1246,7 @@ def main():
     plt.ylabel('Mean Squared Error')
     plt.legend()
     plt.grid(True)
-    plt.savefig('results/final_gp_comparison.png')
+    plt.savefig(f'{plot_dir}/final_gp_comparison.png')
     
     # Show a demo of trained agents
     env = MultiAgentEnvironment(n_agents=N_AGENTS, n_rewards=10, max_steps=100)
@@ -1191,8 +1256,80 @@ def main():
         policy_func=dist_mbpo.trained_policy,
         render=True,
         save_video=True,
-        video_name="trained_distributed_mbpo"
+        video_name=f"{run_id}_trained_distributed_mbpo"
     )
 
+def run_multiple_seeds(seeds=[0, 1, 2, 3, 4]):
+    """Run multiple training instances with different random seeds."""
+    for seed in seeds:
+        print(f"===============================================")
+        print(f"Starting training with seed {seed}")
+        print(f"===============================================")
+        main(seed=seed)
+
+def plot_aggregated_results(seeds=[0, 1, 2, 3, 4]):
+    """Load results from multiple seeds and plot aggregated statistics."""
+    data_dir = "results/data"
+    
+    all_histories = []
+    for seed in seeds:
+        filename = f"{data_dir}/history_seed_{seed}.json"
+        try:
+            with open(filename, 'r') as f:
+                history = json.load(f)
+                all_histories.append(history)
+            print(f"Loaded data for seed {seed}")
+        except FileNotFoundError:
+            print(f"No data found for seed {seed}")
+    
+    if not all_histories:
+        print("No data found for plotting")
+        return
+    
+    # Create output directory for aggregated plots
+    agg_plot_dir = "results/aggregated"
+    os.makedirs(agg_plot_dir, exist_ok=True)
+    
+    # Plot episode rewards across seeds
+    plt.figure(figsize=(10, 6))
+    
+    # Find shortest history length to align data
+    min_episodes = min(len(h['episode_rewards']) for h in all_histories)
+    
+    # Plot individual seed data
+    for i, h in enumerate(all_histories):
+        plt.plot(h['episode_rewards'][:min_episodes], alpha=0.3, 
+                 label=f"Seed {h['seed']}")
+    
+    # Plot mean and std
+    rewards_array = np.array([h['episode_rewards'][:min_episodes] for h in all_histories])
+    mean_rewards = np.mean(rewards_array, axis=0)
+    std_rewards = np.std(rewards_array, axis=0)
+    
+    plt.plot(mean_rewards, 'k-', linewidth=2, label="Mean")
+    plt.fill_between(range(len(mean_rewards)), 
+                     mean_rewards - std_rewards, 
+                     mean_rewards + std_rewards, 
+                     alpha=0.2, color='k')
+    
+    plt.title('Episode Rewards Across Seeds')
+    plt.xlabel('Episode')
+    plt.ylabel('Total Reward')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f'{agg_plot_dir}/aggregated_rewards.png')
+    
+    # Add similar plots for model losses, prediction errors, etc.
+    # ...
+    
+    print(f"Aggregated plots saved to {agg_plot_dir}/")
+
 if __name__ == "__main__":
-    main()
+    # For a single run with default seed:
+    # main()
+    
+    # For multiple seeds (uncomment to use):
+    run_multiple_seeds(seeds=[0, 1, 2, 3, 4])
+
+    # To plot aggregated results after multiple runs:
+    plot_aggregated_results(seeds=[0, 1, 2, 3, 4])
