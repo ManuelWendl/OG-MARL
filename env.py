@@ -141,7 +141,7 @@ class MultiAgentEnvironment:
 
         if self.action_penalty:
             # Apply action penalty if enabled
-            total_reward -= np.sum(np.abs(actions)) * 0.1
+            total_reward -= np.sum(np.abs(actions))
         
         # Update step counter
         self.current_step += 1
