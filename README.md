@@ -6,11 +6,11 @@ As a baseline, ODMAR is compared against standard SAC agents that do not share a
 <table>
   <tr>
     <td align="center">
-      <img src="assets/ODMAR.gif" alt="ODMAR" width="300"/><br/>
+      <img src="assets/ODMAR.gif" alt="ODMAR" width="500"/><br/>
       <b>ODMAR</b>
     </td>
     <td align="center">
-      <img src="assets/SAC.gif" alt="SAC" width="300"/><br/>
+      <img src="assets/SAC.gif" alt="SAC" width="500"/><br/>
       <b>SAC</b>
     </td>
   </tr>
