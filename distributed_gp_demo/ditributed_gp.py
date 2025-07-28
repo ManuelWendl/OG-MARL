@@ -201,7 +201,7 @@ plt.figure(figsize=(6, 3))
 max_rounds = 150
 rounds_range = np.arange(max_rounds + 1)
 
-colors_graph = {'Cycle': colors[0], 'Path': colors[3], 'Star': colors[6]}
+colors_graph = {'Cycle': colors[0], 'Path': colors[1], 'Star': colors[2]}
 
 for graph_name, W_graph in graphs.items():
     print(f"Computing convergence for {graph_name} graph...")
@@ -220,6 +220,7 @@ for graph_name, W_graph in graphs.items():
                      color=colors_graph[graph_name], alpha=0.2)
 
 plt.yscale('log')
+plt.grid(True)
 plt.xlabel('Communication Rounds')
 plt.ylabel(r'Convergence Error')
 plt.legend()
@@ -294,18 +295,19 @@ for k in range(4):
     # Plot predictions
     plt.subplot(2, 2, k+1)
     # True deterministic prediction
-    plt.scatter(test_s[:,0], pred_true[:,0], label='True Data', color=colors[0])
-    plt.plot(test_s[:,0], pred_cons[:,0], label='Consensus Prediction', color=colors[3])
-    plt.plot(test_s[:,0], pred_glob[:,0], label='Global Prediction', color=colors[6])
+    plt.plot(test_s[:,0], pred_cons[:,0], label='Consensus Prediction', color=colors[0])
+    plt.scatter(test_s[:,0], pred_true[:,0], label='True Data', color=colors[1])
+    plt.plot(test_s[:,0], pred_glob[:,0], label='Global Prediction', color=colors[2])
     plt.fill_between(test_s[:,0], 
                     pred_cons[:,0] - 2* np.sqrt(np.diag(K_test.dot(S_cons).dot(K_test.T))),
                     pred_cons[:,0] + 2* np.sqrt(np.diag(K_test.dot(S_cons).dot(K_test.T))),
-                    color=colors[3], alpha=0.2)
+                    color=colors[0], alpha=0.2)
     plt.fill_between(test_s[:,0], 
                     pred_glob[:,0] - 2* np.sqrt(np.diag(K_test.dot(S_glob).dot(K_test.T))),
                     pred_glob[:,0] + 2* np.sqrt(np.diag(K_test.dot(S_glob).dot(K_test.T))),
-                    color=colors[6], alpha=0.2)
+                    color=colors[2], alpha=0.2)
     plt.title(f'Communication Rounds: {K_rounds}')
+    plt.grid(True)
     plt.xlabel(r'$x_t$')
     plt.ylabel(r'$x_{t+1}$')
     if k == 0:
