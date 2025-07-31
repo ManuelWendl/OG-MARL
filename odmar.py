@@ -43,7 +43,7 @@ USE_DISTRIBUTED_MODEL = True
 UPDATES_PER_STEP = 10  
 REAL_RATIO = 0.0  
 IMAGINARY_ROLLOUT_LENGTH = 2  
-OPTIMISM_SCALE = 0.0 
+OPTIMISM_SCALE = 0.01 
 SEED = 0
 
 # Set seeds for reproducibility
@@ -598,7 +598,7 @@ class DistributedMBPO:
     
     def __init__(self):
         # Create environment
-        self.env = MultiAgentEnvironment(n_agents=N_AGENTS, n_rewards=1, max_steps=MAX_STEPS, action_penalty=ACTION_PENALTY)
+        self.env = MultiAgentEnvironment(n_agents=N_AGENTS, n_rewards=10, max_steps=MAX_STEPS, action_penalty=ACTION_PENALTY)
         
         # Create agents
         self.agents = [SACAgent(i, AGENT_STATE_DIM, ACTION_DIM) for i in range(N_AGENTS)]
@@ -1257,7 +1257,7 @@ def main(seed=None):
     plt.savefig(f'{plot_dir}/final_gp_comparison.png')
     
     # Show a demo of trained agents
-    env = MultiAgentEnvironment(n_agents=N_AGENTS, n_rewards=1, max_steps=MAX_STEPS, action_penalty=ACTION_PENALTY)
+    env = MultiAgentEnvironment(n_agents=N_AGENTS, n_rewards=10, max_steps=MAX_STEPS, action_penalty=ACTION_PENALTY)
     
     # Run episode with video
     env.run_episode_with_policy(
