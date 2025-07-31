@@ -1,3 +1,5 @@
+import json
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -7,32 +9,41 @@ from torch.distributions import Normal
 import matplotlib.pyplot as plt
 from collections import deque
 import random
-import time
+import copy
 from env import MultiAgentEnvironment
 import os
+import sys
 
 # Use GPU if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
 # Constants
+MAX_TRAINING_STEPS = 10000
+MAX_STEPS = 100
+EVAL_INTERVAL = 200
 N_AGENTS = 5
-AGENT_STATE_DIM = 2  # Each agent has 2D position (x, y)
-ACTION_DIM = 2  # Each agent has 2D action (dx, dy)
-GLOBAL_STATE_DIM = N_AGENTS * AGENT_STATE_DIM  # Used for environment interaction
-CONSENSUS_ROUNDS = 10
+ACTION_PENALTY = True  
+AGENT_STATE_DIM = 2  
+ACTION_DIM = 2  
+GLOBAL_STATE_DIM = N_AGENTS * AGENT_STATE_DIM  
+CONSENSUS_ROUNDS = 100
 
 # Hyperparameters
 BUFFER_SIZE = 1000000
 BATCH_SIZE = 256
 GAMMA = 0.99
-TAU = 0.005  # For soft update
+TAU = 0.005  
 ALPHA_LR = 3e-4
 ACTOR_LR = 3e-4
 CRITIC_LR = 3e-4
 MODEL_BATCH_SIZE = 256
 MODEL_TRAIN_FREQ = 250
-REAL_RATIO = 0.05  # Ratio of real to model data for policy update
-IMAGINARY_ROLLOUT_LENGTH = 5  # Length of model rollouts
+USE_DISTRIBUTED_MODEL = True  
+UPDATES_PER_STEP = 10  
+REAL_RATIO = 0.0  
+IMAGINARY_ROLLOUT_LENGTH = 2  
+OPTIMISM_SCALE = 0.0 
 SEED = 0
 
 # Set seeds for reproducibility
@@ -76,8 +87,8 @@ class DistributedGP:
         self.kernel_type = kernel_type  # 'rbf', 'linear', or 'combined'
         
         # Kernel hyperparameters
-        self.lengthscale = 10.0  # Hyperparameter for RBF kernel
-        self.noise_var = 1.0  # Observation noise variance
+        self.lengthscale = 2.0  # Hyperparameter for RBF kernel
+        self.noise_var = 0.01  # Observation noise variance
         self.linear_coef = 1.0  # Coefficient for linear kernel
         self.linear_constant = 0.1  # Constant term in linear kernel
         
@@ -130,7 +141,7 @@ class DistributedGP:
         else:
             raise ValueError(f"Unsupported kernel type: {self.kernel_type}")
     
-    def initialize_model(self, dataset_list, n_inducing=100):
+    def initialize_model(self, dataset_list, n_inducing=1000):
         """Initialize GP model for each agent using their local datasets."""
         # Combine all data to sample inducing points
         all_X = np.vstack([data[0] for data in dataset_list])
@@ -224,7 +235,6 @@ class DistributedGP:
             
             J_new.append(Ji)
             h_new.append(hi)
-        
         # Update natural parameters
         self.J_list = J_new
         self.h_list = h_new
@@ -249,6 +259,144 @@ class DistributedGP:
         mean = K_test.dot(self.m_list[agent_idx])
         var = np.diag(self.compute_kernel(X, X) - K_test.dot(self.S_list[agent_idx]).dot(K_test.T))
         return mean, var
+    
+class CentralizedGP:
+    """Centralized GP model used by all agents."""
+    
+    def __init__(self, state_dim, action_dim, kernel_type="combined"):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.input_dim = state_dim + action_dim
+        self.output_dim = state_dim
+        self.kernel_type = kernel_type
+        
+        # Kernel hyperparameters
+        self.lengthscale = 2.0  # Hyperparameter for RBF kernel
+        self.noise_var = 0.01  # Observation noise variance
+        self.linear_coef = 0.5  # Coefficient for linear kernel
+        self.linear_constant = 0.1  # Constant term in linear kernel
+        
+        # These will be initialized in initialize_model
+        self.Z = None  # Inducing points
+        self.m = None  # Mean vector
+        self.S = None  # Covariance matrix
+        self.Kzz = None  # Kernel matrix of inducing points
+        self.Kzz_inv = None  # Inverse of Kzz
+        
+        # For tracking model loss
+        self.model_losses = []
+    
+    def rbf_kernel(self, X1, X2):
+        """RBF kernel function."""
+        sqdist = np.sum(X1**2, 1).reshape(-1, 1) + np.sum(X2**2, 1) - 2*np.dot(X1, X2.T)
+        return np.exp(-0.5/self.lengthscale**2 * sqdist)
+    
+    def linear_kernel(self, X1, X2):
+        """Linear kernel function: k(x,y) = x^T y + c"""
+        return self.linear_coef * np.dot(X1, X2.T) + self.linear_constant
+    
+    def combined_kernel(self, X1, X2):
+        """Combined RBF and Linear kernel"""
+        return self.rbf_kernel(X1, X2) + self.linear_kernel(X1, X2)
+    
+    def compute_kernel(self, X1, X2):
+        """Compute kernel based on selected type"""
+        if self.kernel_type == "rbf":
+            return self.rbf_kernel(X1, X2)
+        elif self.kernel_type == "linear":
+            return self.linear_kernel(X1, X2)
+        elif self.kernel_type == "combined":
+            return self.combined_kernel(X1, X2)
+        else:
+            raise ValueError(f"Unsupported kernel type: {self.kernel_type}")
+    
+    def initialize_model(self, dataset_list, n_inducing=1000):
+        """Initialize GP model using data from all agents."""
+        # Combine all data
+        all_X = np.vstack([X for X, _ in dataset_list])
+        all_Y = np.vstack([Y for _, Y in dataset_list])
+        
+        # Sample inducing points
+        if all_X.shape[0] > n_inducing:
+            idx = np.random.choice(all_X.shape[0], n_inducing, replace=False)
+            self.Z = all_X[idx]
+        else:
+            self.Z = all_X.copy()  # Use all data points if less than n_inducing
+            
+        # Compute Kzz (inducing points kernel matrix)
+        self.Kzz = self.compute_kernel(self.Z, self.Z)
+        self.Kzz_inv = np.linalg.inv(self.Kzz + 1e-6 * np.eye(self.Kzz.shape[0]))
+        
+        # Compute posterior
+        Kzx = self.compute_kernel(self.Z, all_X)
+        Kxz = Kzx.T
+        
+        # Compute posterior parameters
+        A = Kzx.dot(Kxz) / self.noise_var + self.Kzz
+        b = Kzx.dot(all_Y) / self.noise_var
+        
+        try:
+            self.S = np.linalg.inv(A)
+            self.m = self.S.dot(b)
+        except np.linalg.LinAlgError:
+            # Fall back to more stable but slower approach
+            self.S = np.linalg.inv(A + 1e-6 * np.eye(A.shape[0]))
+            self.m = self.S.dot(b)
+        
+        # Calculate initial loss
+        Y_pred = self.predict(all_X)
+        mse = np.mean(np.square(all_Y - Y_pred))
+        self.model_losses.append(mse)
+        
+        print(f"Model initialized with {len(self.Z)} inducing points, initial MSE: {mse:.4f}")
+        return mse
+    
+    def predict(self, X):
+        """Make prediction using posterior."""
+        K_test = self.compute_kernel(X, self.Z)
+        return K_test.dot(self.m)
+    
+    def predict_with_variance(self, X):
+        """Make prediction with variance for uncertainty estimation."""
+        K_test = self.compute_kernel(X, self.Z)
+        mean = K_test.dot(self.m)
+        
+        # Calculate variance
+        var_diag = np.diag(self.compute_kernel(X, X)) - np.sum(K_test.dot(self.S) * K_test, axis=1)
+        
+        # Ensure positive variance
+        var_diag = np.maximum(var_diag, 1e-6)
+        
+        return mean, var_diag
+    
+    def update_model(self, dataset_list):
+        """Update GP model with new data."""
+        # Combine all data
+        all_X = np.vstack([X for X, _ in dataset_list])
+        all_Y = np.vstack([Y for _, Y in dataset_list])
+        
+        # Recompute posterior with new data
+        Kzx = self.compute_kernel(self.Z, all_X)
+        Kxz = Kzx.T
+        
+        # Compute posterior parameters
+        A = Kzx.dot(Kxz) / self.noise_var + self.Kzz
+        b = Kzx.dot(all_Y) / self.noise_var
+        
+        try:
+            self.S = np.linalg.inv(A)
+            self.m = self.S.dot(b)
+        except np.linalg.LinAlgError:
+            # Fall back to more stable approach
+            self.S = np.linalg.inv(A + 1e-6 * np.eye(A.shape[0]))
+            self.m = self.S.dot(b)
+        
+        # Calculate model loss
+        Y_pred = self.predict(all_X)
+        mse = np.mean(np.square(all_Y - Y_pred))
+        self.model_losses.append(mse)
+        
+        return mse
 
 class PolicyNetwork(nn.Module):
     """Actor network for SAC."""
@@ -446,11 +594,11 @@ class SACAgent:
         }
 
 class DistributedMBPO:
-    """Distributed Model-Based Policy Optimization algorithm."""
+    """Distributed Model-Based Policy Optimization algorithm with GP comparison."""
     
     def __init__(self):
         # Create environment
-        self.env = MultiAgentEnvironment(n_agents=N_AGENTS, n_rewards=10, max_steps=200)
+        self.env = MultiAgentEnvironment(n_agents=N_AGENTS, n_rewards=1, max_steps=MAX_STEPS, action_penalty=ACTION_PENALTY)
         
         # Create agents
         self.agents = [SACAgent(i, AGENT_STATE_DIM, ACTION_DIM) for i in range(N_AGENTS)]
@@ -461,8 +609,9 @@ class DistributedMBPO:
         # Create model buffers for each agent (imaginary data)
         self.model_buffers = [ReplayBuffer(BUFFER_SIZE, BATCH_SIZE) for _ in range(N_AGENTS)]
         
-        # Initialize distributed GP model
-        self.model = None
+        # Initialize GP models
+        self.centralized_model = None
+        self.distributed_model = None
         
         # For collecting initial data
         self.data_collection_steps = 5000
@@ -470,6 +619,13 @@ class DistributedMBPO:
         # For tracking rewards
         self.episode_rewards = []
         self.steps_per_episode = []
+        
+        # For comparing GP models
+        self.prediction_errors = {
+            'centralized': [],
+            'distributed': [],
+            'difference': []
+        }
     
     def collect_initial_data(self):
         """Collect initial data with random actions."""
@@ -510,8 +666,8 @@ class DistributedMBPO:
         return agent_states
     
     def initialize_model(self):
-        """Initialize the distributed GP model with collected data."""
-        print("Initializing distributed GP model...")
+        """Initialize both centralized and distributed GP models with collected data."""
+        print("Initializing GP models...")
         
         # Prepare data for each agent
         dataset_list = []
@@ -527,7 +683,7 @@ class DistributedMBPO:
                 actions = np.array(actions)
                 next_states = np.array(next_states)
                 
-                # Compute delta states (for the agent's own state)
+                # Compute delta states
                 delta_states = next_states - states
                 
                 # Input is state + action
@@ -538,30 +694,41 @@ class DistributedMBPO:
             else:
                 raise ValueError(f"Not enough data in replay buffer for agent {i} to initialize model")
         
-        # Initialize model
-        self.model = DistributedGP(
-            N_AGENTS, 
+        # Initialize centralized model
+        self.centralized_model = CentralizedGP(
             AGENT_STATE_DIM, 
             ACTION_DIM, 
-            graph_type="Cycle", 
             kernel_type="combined"  # Use combined RBF + Linear kernel
         )
-        self.model.initialize_model(dataset_list)
+        centralized_loss = self.centralized_model.initialize_model(dataset_list)
+        print(f"Centralized GP initialized with MSE: {centralized_loss:.4f}")
+        
+        # Initialize distributed model
+        self.distributed_model = DistributedGP(
+            N_AGENTS, 
+            AGENT_STATE_DIM, 
+            ACTION_DIM,
+            kernel_type="combined"
+        )
+        self.distributed_model.initialize_model(dataset_list)
+        
+        # Initial comparison
+        self.compare_gp_models(dataset_list)
     
-    def generate_imaginary_data(self):
-        """Generate imaginary data using the model for MBPO."""
-        print("Generating imaginary data...")
+    def generate_imaginary_data(self, use_distributed=True):
+        """Generate imaginary data using the selected GP model."""
+        model_name = "distributed" if use_distributed else "centralized"
+        print(f"Generating imaginary data using {model_name} GP model...")
         
-        # Clear previous imaginary data
-        for buffer in self.model_buffers:
-            buffer.buffer.clear()
-        
+        # Track buffer sizes before generating data
+        buffer_sizes_before = [len(buffer) for buffer in self.model_buffers]
+    
         # Generate imaginary trajectories for each agent
         for agent_idx, agent in enumerate(self.agents):
             # Sample real states from agent's replay buffer as starting points
             if len(self.replay_buffers[agent_idx]) < BATCH_SIZE:
                 continue
-                
+            
             indices = np.random.choice(len(self.replay_buffers[agent_idx].buffer), BATCH_SIZE, replace=False)
             initial_transitions = [self.replay_buffers[agent_idx].buffer[idx] for idx in indices]
             
@@ -574,31 +741,49 @@ class DistributedMBPO:
                     action = agent.select_action(state)
                     
                     # Prepare input for GP model
-                    model_input = np.concatenate([state, action])
+                    model_input = np.concatenate([state, action]).reshape(1, -1)
                     
-                    # Predict next state using the model
-                    delta_state_mean, delta_state_var = self.model.predict_with_variance(
-                        agent_idx, model_input.reshape(1, -1))
+                    # Predict next state using the selected model
+                    if use_distributed:
+                        delta_state_mean, delta_state_var = self.distributed_model.predict_with_variance(agent_idx, model_input)
+                    else:
+                        delta_state_mean, delta_state_var = self.centralized_model.predict_with_variance(model_input)
                     
                     # Add noise proportional to uncertainty
-                    noise = np.random.normal(0, np.sqrt(delta_state_var))
-                    delta_state = delta_state_mean.flatten() + noise
+                    delta_state = delta_state_mean.flatten()
                     
                     # Compute next state
                     next_state = state + delta_state
                     
-                    # Simple reward estimation (can be improved)
-                    reward = -0.01 * np.sum(next_state**2)  # Simple penalty for distance from origin
+                    # Use environment reward function instead of approximate reward
+                    env_copy = copy.deepcopy(self.env)
+                    # Set the environment to the current state
+                    all_agent_positions = np.zeros((N_AGENTS, AGENT_STATE_DIM))
+                    all_agent_positions[agent_idx] = state
+                    env_copy.agent_positions = all_agent_positions
                     
-                    # Add to agent's model buffer
+                    # Step environment with just this agent's action
+                    all_actions = np.zeros((N_AGENTS, ACTION_DIM))
+                    all_actions[agent_idx] = action
+                    _, reward, _, _ = env_copy.step(all_actions)
+
+                    # Add optimism to reward
+                    reward += OPTIMISM_SCALE * np.sqrt(np.sum(delta_state_var))
+                    
+                    # Store transition
                     self.model_buffers[agent_idx].add(state, action, reward, next_state, False)
                     
                     # Update state for next step in rollout
                     state = next_state
     
+        # Print buffer sizes for debugging
+        buffer_sizes_after = [len(buffer) for buffer in self.model_buffers]
+        print(f"Model buffer sizes before: {buffer_sizes_before}")
+        print(f"Model buffer sizes after: {buffer_sizes_after}")
+    
     def update_model(self):
-        """Update the distributed GP model with new data."""
-        print("Updating model...")
+        """Update both GP models with new data."""
+        print("Updating GP models...")
         
         # Prepare data for each agent
         dataset_list = []
@@ -625,37 +810,146 @@ class DistributedMBPO:
             else:
                 raise ValueError(f"Not enough data in replay buffer for agent {i}")
         
-        # Update model
-        model_loss = self.model.update_model(dataset_list)
-        print(f"Model loss: {model_loss:.4f}")
+        # Update centralized model
+        centralized_loss = self.centralized_model.update_model(dataset_list)
+        print(f"Centralized model loss: {centralized_loss:.4f}")
+        
+        # Update distributed model
+        distributed_loss = self.distributed_model.update_model(dataset_list)
+        print(f"Distributed model average loss: {distributed_loss:.4f}")
+        
+        # Compare models after update
+        self.compare_gp_models(dataset_list)
+        
+        return centralized_loss  
+    
+    def compare_gp_models(self, dataset_list):
+        """Compare predictions of centralized and distributed GP models."""
+        total_centralized_mse = 0
+        total_distributed_mse = 0
+        total_difference_mse = 0
+        total_samples = 0
+        
+        for agent_idx, (X, Y) in enumerate(dataset_list):
+            # Get predictions from both models
+            centralized_preds = self.centralized_model.predict(X)
+            distributed_preds = self.distributed_model.predict(agent_idx, X)
+            
+            # Compute MSE against ground truth for both models
+            centralized_mse = np.mean(np.square(Y - centralized_preds))
+            distributed_mse = np.mean(np.square(Y - distributed_preds))
+            
+            # Compute MSE between model predictions
+            difference_mse = np.mean(np.square(centralized_preds - distributed_preds))
+            
+            # Weight by number of samples
+            n_samples = X.shape[0]
+            total_samples += n_samples
+            total_centralized_mse += centralized_mse * n_samples
+            total_distributed_mse += distributed_mse * n_samples
+            total_difference_mse += difference_mse * n_samples
+        
+        # Compute weighted averages
+        avg_centralized_mse = total_centralized_mse / total_samples
+        avg_distributed_mse = total_distributed_mse / total_samples
+        avg_difference_mse = total_difference_mse / total_samples
+        
+        # Store results for plotting
+        self.prediction_errors['centralized'].append(avg_centralized_mse)
+        self.prediction_errors['distributed'].append(avg_distributed_mse)
+        self.prediction_errors['difference'].append(avg_difference_mse)
+        
+        print(f"Model Comparison - Centralized MSE: {avg_centralized_mse:.4f}, "
+            f"Distributed MSE: {avg_distributed_mse:.4f}, Difference: {avg_difference_mse:.4f}")
+        
+        # Visualize comparison every few updates
+        if len(self.prediction_errors['centralized']) % 5 == 0:
+            self.plot_gp_comparison()
+
+    def plot_gp_comparison(self):
+        """Plot comparison of centralized and distributed GP models."""
+        updates = range(1, len(self.prediction_errors['centralized']) + 1)
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(updates, self.prediction_errors['centralized'], 'b-', label='Centralized GP MSE')
+        plt.plot(updates, self.prediction_errors['distributed'], 'r-', label='Distributed GP MSE')
+        plt.plot(updates, self.prediction_errors['difference'], 'g--', label='Prediction Difference')
+        plt.title('GP Model Comparison')
+        plt.xlabel('Model Updates')
+        plt.ylabel('Mean Squared Error')
+        plt.legend()
+        plt.grid(True)
+        
+        # Create results directory if it doesn't exist
+        os.makedirs("results", exist_ok=True)
+        
+        plt.savefig(f'results/gp_comparison_update_{len(updates)}.png')
+        plt.close()
     
     def train_step(self, total_steps):
-        """Perform one training step."""
+        """Perform one training step using both real and model data."""
         losses = {
             'critic_loss': [],
             'actor_loss': [],
             'alpha_loss': []
         }
         
-        # Update each agent using only real environment data
-        for agent_idx, agent in enumerate(self.agents):
-            # Use only real data from environment
-            if len(self.replay_buffers[agent_idx]) >= BATCH_SIZE:
-                # Sample batch from replay buffer
-                batch = self.replay_buffers[agent_idx].sample()
+        # Update models and generate imaginary data periodically
+        if total_steps % MODEL_TRAIN_FREQ == 0:
+            self.update_model()
+            # Alternate between centralized and distributed model
+            self.generate_imaginary_data(use_distributed=USE_DISTRIBUTED_MODEL)
+
+        for _ in range(UPDATES_PER_STEP):
+        
+            # Update each agent using combined real and model data
+            for agent_idx, agent in enumerate(self.agents):
+                real_buffer = self.replay_buffers[agent_idx]
+                model_buffer = self.model_buffers[agent_idx]
                 
-                # Update agent parameters
+                # Skip if real buffer doesn't have enough data
+                if len(real_buffer) < BATCH_SIZE:
+                    continue
+                
+                # Case 1: If we have model data, mix it according to REAL_RATIO
+                if len(model_buffer) >= BATCH_SIZE:
+                    # Calculate number of samples from each buffer
+                    real_samples = max(int(BATCH_SIZE * REAL_RATIO), 1)  # At least 1 real sample
+                    model_samples = BATCH_SIZE - real_samples
+                    
+                    # Sample from real buffer
+                    real_indices = np.random.choice(len(real_buffer.buffer), real_samples, replace=False)
+                    real_batch = [real_buffer.buffer[idx] for idx in real_indices]
+                    
+                    # Sample from model buffer
+                    model_indices = np.random.choice(len(model_buffer.buffer), model_samples, replace=False)
+                    model_batch = [model_buffer.buffer[idx] for idx in model_indices]
+                    
+                    # Combine batches and shuffle
+                    combined_batch = real_batch + model_batch
+                    random.shuffle(combined_batch)  # Mix real and model data
+                    
+                    # Convert to tensors
+                    states, actions, rewards, next_states, dones = zip(*combined_batch)
+                    batch = (
+                        torch.FloatTensor(states).to(device),
+                        torch.FloatTensor(actions).to(device),
+                        torch.FloatTensor(rewards).unsqueeze(1).to(device),
+                        torch.FloatTensor(next_states).to(device),
+                        torch.FloatTensor(dones).unsqueeze(1).to(device)
+                    )
+                
+                # Case 2: If no model data yet, just use real data
+                else:
+                    batch = real_buffer.sample()
+                
+                # Update agent parameters with the batch
                 update_info = agent.update_parameters(batch)
                 
                 # Record losses
                 for k, v in update_info.items():
                     if k in losses:
                         losses[k].append(v)
-        
-        # Skip model updates for debugging
-        if False and total_steps % MODEL_TRAIN_FREQ == 0:
-            self.update_model()
-            self.generate_imaginary_data()
         
         # Average losses across agents
         avg_losses = {}
@@ -665,7 +959,7 @@ class DistributedMBPO:
         
         return avg_losses
     
-    def train(self, max_steps=1000000, eval_interval=5000):
+    def train(self, max_steps=MAX_TRAINING_STEPS, eval_interval=EVAL_INTERVAL, run_id=None, plot_dir=None):
         """Train the distributed MBPO algorithm."""
         print("Starting training...")
         
@@ -721,8 +1015,8 @@ class DistributedMBPO:
                     actor_losses.append(losses.get('actor_loss', 0))
                     alpha_losses.append(losses.get('alpha_loss', 0))
                 
-                if self.model and self.model.model_losses:
-                    model_losses = self.model.model_losses
+                if self.centralized_model and self.centralized_model.model_losses:
+                    model_losses = self.centralized_model.model_losses
             
             # Reset if episode is done
             if done:
@@ -751,7 +1045,9 @@ class DistributedMBPO:
                     alpha_losses, 
                     model_losses, 
                     eval_rewards,
-                    total_steps
+                    total_steps,
+                    run_id=run_id,
+                    plot_dir=plot_dir
                 )
                 
                 print(f"Step {total_steps}: Eval reward = {eval_reward:.2f}")
@@ -797,8 +1093,9 @@ class DistributedMBPO:
             
         return actions
 
-    def plot_training_curves(self, steps, critic_losses, actor_losses, alpha_losses, model_losses, eval_rewards, step):
+    def plot_training_curves(self, steps, critic_losses, actor_losses, alpha_losses, model_losses, eval_rewards, step, run_id=None, plot_dir=None):
         """Plot and save training curves."""
+        # Original plots for training curves (keeping as is)
         fig, axs = plt.subplots(2, 2, figsize=(12, 10))
         
         # Critic loss
@@ -849,30 +1146,94 @@ class DistributedMBPO:
         
         # Create results directory if it doesn't exist
         os.makedirs("results", exist_ok=True)
-        
-        plt.savefig(f'results/training_curves_step_{step}.png')
+        if run_id:
+            plt.savefig(f'{plot_dir}/training_curves_step_{step}.png')
+        else:
+            plt.savefig(f'results/training_curves_step_{step}.png')
         plt.close()
+        
+        # Plot GP model comparison if we have data
+        if self.prediction_errors['centralized'] and self.prediction_errors['distributed']:
+            self.plot_gp_comparison()
 
-def main():
-    """Main function to run the distributed MBPO algorithm."""
-    # Create output directory if it doesn't exist
-    os.makedirs("results", exist_ok=True)
+def main(seed=None):
+    """Main function to run the distributed MBPO algorithm with GP comparison."""
+    # Set seed if provided
+    if seed is not None:
+        global SEED
+        SEED = seed
+        torch.manual_seed(SEED)
+        np.random.seed(SEED)
+        random.seed(SEED)
+    
+    # Create timestamp for unique run identification
+    timestamp = int(time.time())
+    run_id = f"seed_{SEED}_time_{timestamp}"
+    
+    # Create output directories
+    results_dir = "results"
+    data_dir = f"{results_dir}/data"
+    plot_dir = f"{results_dir}/{run_id}"
+    os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(plot_dir, exist_ok=True)
+    
+    print(f"Starting training run with seed {SEED}")
     
     # Initialize and train the algorithm
     dist_mbpo = DistributedMBPO()
     episode_rewards, steps_per_episode = dist_mbpo.train(
-        max_steps=500000,  # Adjust based on available computational resources
-        eval_interval=5000
+        max_steps=MAX_TRAINING_STEPS,  # Adjust based on available computational resources
+        eval_interval=EVAL_INTERVAL,
+        run_id=run_id,
+        plot_dir=plot_dir
     )
     
-    # Plot final training results
+    # Collect all training history data
+    training_history = {
+        'seed': SEED,
+        'timestamp': timestamp,
+        'episode_rewards': episode_rewards,
+        'steps_per_episode': steps_per_episode,
+        'prediction_errors': {
+            'centralized': dist_mbpo.prediction_errors['centralized'],
+            'distributed': dist_mbpo.prediction_errors['distributed'],
+            'difference': dist_mbpo.prediction_errors['difference']
+        },
+        'agent_losses': {
+            'critic_losses': [agent.critic_losses for agent in dist_mbpo.agents],
+            'actor_losses': [agent.actor_losses for agent in dist_mbpo.agents],
+            'alpha_losses': [agent.alpha_losses for agent in dist_mbpo.agents]
+        },
+        'model_losses': dist_mbpo.centralized_model.model_losses if dist_mbpo.centralized_model else [],
+    }
+    
+    # Save to JSON file
+    filename = f"{data_dir}/history_seed_{SEED}.json"
+    with open(filename, 'w') as f:
+        # Convert numpy arrays to lists for JSON serialization
+        json_data = {k: v if not isinstance(v, (np.ndarray, list)) or not isinstance(v[0], np.ndarray)
+                     else [x.tolist() if isinstance(x, np.ndarray) else x for x in v]
+                     for k, v in training_history.items()}
+        
+        # Handle nested dictionaries
+        for k, v in json_data.items():
+            if isinstance(v, dict):
+                json_data[k] = {k2: v2 if not isinstance(v2, (np.ndarray, list)) or not isinstance(v2[0], np.ndarray)
+                              else [x.tolist() if isinstance(x, np.ndarray) else x for x in v2]
+                              for k2, v2 in v.items()}
+                
+        json.dump(json_data, f, indent=2)
+    
+    print(f"Training history saved to {filename}")
+    
+    # Plot final training results in the run-specific directory
     plt.figure(figsize=(10, 6))
     plt.plot(episode_rewards)
     plt.title('Episode Rewards')
     plt.xlabel('Episode')
     plt.ylabel('Total Reward')
     plt.grid(True)
-    plt.savefig('results/final_rewards.png')
+    plt.savefig(f'{plot_dir}/final_rewards.png')
     
     plt.figure(figsize=(10, 6))
     plt.plot(steps_per_episode)
@@ -880,18 +1241,114 @@ def main():
     plt.xlabel('Episode')
     plt.ylabel('Steps')
     plt.grid(True)
-    plt.savefig('results/steps_per_episode.png')
+    plt.savefig(f'{plot_dir}/steps_per_episode.png')
+    
+    # Final GP model comparison
+    plt.figure(figsize=(10, 6))
+    updates = range(1, len(dist_mbpo.prediction_errors['centralized']) + 1)
+    plt.plot(updates, dist_mbpo.prediction_errors['centralized'], 'b-', label='Centralized GP MSE')
+    plt.plot(updates, dist_mbpo.prediction_errors['distributed'], 'r-', label='Distributed GP MSE')
+    plt.plot(updates, dist_mbpo.prediction_errors['difference'], 'g--', label='Prediction Difference')
+    plt.title('Final GP Model Comparison')
+    plt.xlabel('Model Updates')
+    plt.ylabel('Mean Squared Error')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f'{plot_dir}/final_gp_comparison.png')
     
     # Show a demo of trained agents
-    env = MultiAgentEnvironment(n_agents=N_AGENTS, n_rewards=5, max_steps=100)
+    env = MultiAgentEnvironment(n_agents=N_AGENTS, n_rewards=1, max_steps=MAX_STEPS, action_penalty=ACTION_PENALTY)
     
     # Run episode with video
     env.run_episode_with_policy(
         policy_func=dist_mbpo.trained_policy,
         render=True,
         save_video=True,
-        video_name="trained_distributed_mbpo"
+        video_name=f"{run_id}_trained_distributed_mbpo"
     )
 
+def run_multiple_seeds(seeds=[0, 1, 2, 3, 4]):
+    """Run multiple training instances with different random seeds."""
+    for seed in seeds:
+        print("===============================================")
+        print(f"Starting training with seed {seed}")
+        print("===============================================")
+        main(seed=seed)
+
+def plot_aggregated_results(seeds=[0, 1, 2, 3, 4]):
+    """Load results from multiple seeds and plot aggregated statistics."""
+    data_dir = "results/data"
+    
+    all_histories = []
+    for seed in seeds:
+        filename = f"{data_dir}/history_seed_{seed}.json"
+        try:
+            with open(filename, 'r') as f:
+                history = json.load(f)
+                all_histories.append(history)
+            print(f"Loaded data for seed {seed}")
+        except FileNotFoundError:
+            print(f"No data found for seed {seed}")
+    
+    if not all_histories:
+        print("No data found for plotting")
+        return
+    
+    # Create output directory for aggregated plots
+    agg_plot_dir = "results/aggregated"
+    os.makedirs(agg_plot_dir, exist_ok=True)
+    
+    # Plot episode rewards across seeds
+    plt.figure(figsize=(10, 6))
+    
+    # Find shortest history length to align data
+    min_episodes = min(len(h['episode_rewards']) for h in all_histories)
+    
+    # Plot individual seed data
+    for i, h in enumerate(all_histories):
+        plt.plot(h['episode_rewards'][:min_episodes], alpha=0.3, 
+                 label=f"Seed {h['seed']}")
+    
+    # Plot mean and std
+    rewards_array = np.array([h['episode_rewards'][:min_episodes] for h in all_histories])
+    mean_rewards = np.mean(rewards_array, axis=0)
+    std_rewards = np.std(rewards_array, axis=0)
+    
+    plt.plot(mean_rewards, 'k-', linewidth=2, label="Mean")
+    plt.fill_between(range(len(mean_rewards)), 
+                     mean_rewards - std_rewards, 
+                     mean_rewards + std_rewards, 
+                     alpha=0.2, color='k')
+    
+    plt.title('Episode Rewards Across Seeds')
+    plt.xlabel('Episode')
+    plt.ylabel('Total Reward')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f'{agg_plot_dir}/aggregated_rewards.png')
+    
+    # Add similar plots for model losses, prediction errors, etc.
+    # ...
+    
+    print(f"Aggregated plots saved to {agg_plot_dir}/")
+
 if __name__ == "__main__":
-    main()
+    # Default seeds
+    default_seeds = [0, 1, 2, 3, 4]
+    selected_seeds = None
+
+    # Parse command-line arguments
+    for arg in sys.argv[1:]:
+        if arg.startswith("seed="):
+            try:
+                seed_val = int(arg.split("=")[1])
+                selected_seeds = [seed_val]
+            except ValueError:
+                print("Invalid seed value. Using default seeds.")
+                selected_seeds = default_seeds
+
+    if selected_seeds is None:
+        selected_seeds = default_seeds
+
+    run_multiple_seeds(seeds=selected_seeds)
+    plot_aggregated_results(seeds=selected_seeds)
